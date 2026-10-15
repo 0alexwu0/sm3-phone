@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.Python
+
+# Generated data / database (do NOT commit)
+/data/
+rocksdb/
+rocksdb_build_tmp/
+*.bin
+*.sst
+*.log
+LOG*
+phone_sm3/
+shard_*/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
