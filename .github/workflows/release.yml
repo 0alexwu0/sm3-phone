@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve names
+        id: meta
+        run: |
+          version="${GITHUB_REF_NAME}"
+          repo_lc="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${repo_lc}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        run: |
+          docker build \
+            -t "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}" \
+            -t "${{ steps.meta.outputs.image }}:latest" \
+            .
+
+      - name: Push to GHCR
+        run: |
+          docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}"
+          docker push "${{ steps.meta.outputs.image }}:latest"
+
+      - name: Export image tarball
+        run: |
+          docker save "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}" \
+            | gzip > "sm3-phone-${{ steps.meta.outputs.version }}-docker.tar.gz"
+
+      - name: Create release and upload image
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sm3-phone-${{ steps.meta.outputs.version }}-docker.tar.gz
+          generate_release_notes: true
