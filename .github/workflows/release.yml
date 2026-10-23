@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag to build and attach (e.g. v1.0.0)"
+        required: true
+        default: "v1.0.0"
 
 permissions:
   contents: write
@@ -19,7 +25,11 @@ jobs:
       - name: Resolve names
         id: meta
         run: |
-          version="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="${GITHUB_REF_NAME}"
+          fi
           repo_lc="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${repo_lc}" >> "$GITHUB_OUTPUT"
@@ -51,5 +61,5 @@ jobs:
       - name: Create release and upload image
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.meta.outputs.version }}
           files: sm3-phone-${{ steps.meta.outputs.version }}-docker.tar.gz
-          generate_release_notes: true
