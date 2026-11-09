@@ -79,6 +79,34 @@ python generate.py \
 
 `prefixes.txt` 每行一个号段前缀（如 `139`），支持 `#` 注释行；非 1~10 位 ASCII 数字的行会被跳过并告警，重复前缀会自动去重。
 
+## 追加号段
+
+`append.py` 将指定号段追加写入**既有**数据库，复用 `generate.py` 的同一套流式流水线、分片规则与缓存预算。由于 RocksDB 以 SM3 哈希为 key，追加等同于向对应 shard 批量 `put`：新号段直接写入，已存在的哈希会被幂等覆盖（value 仍是同一手机号），因此重复追加是安全的。
+
+```bash
+# 直接在命令行指定号段（可重复 --prefix）
+python append.py \
+  --db-root /path/to/rocksdb/phone_sm3 \
+  --shards 32 \
+  --prefix 166 --prefix 199
+
+# 或从文件读取（与 --prefix 合并去重）
+python append.py \
+  --db-root /path/to/rocksdb/phone_sm3 \
+  --shards 32 \
+  --prefix-file new_prefixes.txt
+```
+
+| 参数 | 说明 | 默认 |
+| --- | --- | --- |
+| `--prefix` | 要追加的号段前缀，可重复指定；与 `--prefix-file` 合并去重 | — |
+| `--prefix-file` | 号段前缀文件（格式同 `prefixes.txt`） | — |
+| `--db-root` | 既有 RocksDB 目录；不存在则新建 | `/data/rocksdb/phone_sm3` |
+| `--shards` | 分片数，**必须与原库相同**（1~256 范围内的 2 的幂） | 32 |
+| `--workers` / `--chunk-size` / `--batch-size` | 同 `generate.py`，受缓存预算上限约束 | 30 / 500000 / 200000 |
+
+> `--shards` 必须与生成原库时一致，否则分片定位错乱会导致查询查不到。`--prefix` 与 `--prefix-file` 可同时使用，至少需指定其一。
+
 ## 启动查询服务
 
 ```bash
