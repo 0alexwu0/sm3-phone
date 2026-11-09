@@ -22,7 +22,8 @@
 1. **生成（`generate.py`）** —— 单遍流式流水线
    - 从 `prefixes.txt` 读取号段前缀（UTF-8 / BOM 兼容，自动去重，仅接受 1~10 位 ASCII 数字），穷举每个前缀下的所有手机号。
    - 多个 worker 进程（`spawn` 启动）并行计算 SM3，每个任务只返回一块**有界**的内存数据，**不再写临时 spool 文件**。
-   - 单个写入进程（`ShardWriter`）拥有全部 shard，按 `digest[0] & (SHARDS - 1)` 分片，边生成边写入对应 RocksDB（key = 32 字节 SM3，value = 11 字节手机号）。所有 shard 共享同一个 block cache 与 write buffer manager，从而让整体内存受统一预算约束。
+   - 默认由**单个写入进程**（`ShardWriter`）拥有全部 shard，按 `digest[0] & (SHARDS - 1)` 分片，边生成边写入对应 RocksDB（key = 32 字节 SM3，value = 11 字节手机号）。所有 shard 共享同一个 block cache 与 write buffer manager，从而让整体内存受统一预算约束。
+   - 可用 `--builder-workers N`（N>1）开启**多个并行写入进程**：shard 按 `shard % N` 分配给各进程，路由在 worker 内按 `digest[0]` 直接分桶完成，主进程只做分发。磁盘/IO 成为瓶颈时可提升写入吞吐——代价是跨进程无法共享 Cache，缓存预算会按 builder 数平分（每进程 `预算/N`）。
    - 保留 WAL 且 `sync=False`：已提交批次可在进程异常退出后恢复，正常 compaction / stall 阈值提供磁盘背压。
 2. **查询（`server.py`）**
    - 以只读方式打开全部 shard，提供 FastAPI 接口。
@@ -73,12 +74,13 @@ python generate.py \
 | `--shards` | 分片数（**必须是 1~256 范围内的 2 的幂**） | 32 |
 | `--chunk-size` | 每个计算任务的手机号数量（受预算推导上限约束） | 500000 |
 | `--batch-size` | RocksDB WriteBatch 大小（受预算推导上限约束） | 200000 |
+| `--builder-workers` | 并行写入进程数（按 `shard % N` 分配 shard）；`>1` 时缓存预算在各进程间平分，`>shards` 会收敛到 shard 数 | 1 |
 | `--tmp-root` | 临时目录，**仅 `--phase2-only` 使用** | `/data/rocksdb_build_tmp` |
-| `--builder-workers` | **已弃用**：所有 shard 现由同一进程写入以共享缓存（传入仅打印提示） | — |
 | `--keep-temp` | **兼容保留**：流式生成不再创建临时文件，此开关无实际作用 | 关 |
 | `--phase2-only` | 跳过计算，从 `--tmp-root` 导入既有的旧版 spool 文件（导入后保留源文件） | 关 |
 
-> 流式生成不再产生 spool 文件；`--builder-workers` / `--keep-temp` 仅为向后兼容而保留。`--phase2-only` 仅用于导入历史遗留的旧版 spool 文件。
+> `--builder-workers` 默认为 `1`（单写入进程、完整共享预算）。仅当磁盘/IO 成为写入瓶颈时才建议调高——缓存会随之平分，务必结合 `--mem-budget` 评估每进程可用缓存。
+> 流式生成不再产生 spool 文件；`--keep-temp` 仅为向后兼容而保留。`--phase2-only` 仅用于导入历史遗留的旧版 spool 文件，也支持 `--builder-workers` 并行导入。
 
 `prefixes.txt` 每行一个号段前缀（如 `139`），支持 `#` 注释行；非 1~10 位 ASCII 数字的行会被跳过并告警，重复前缀会自动去重。
 
@@ -107,6 +109,7 @@ python append.py \
 | `--db-root` | 既有 RocksDB 目录；不存在则新建 | `/data/rocksdb/phone_sm3` |
 | `--shards` | 分片数，**必须与原库相同**（1~256 范围内的 2 的幂） | 32 |
 | `--mem-budget` | 共享缓存预算（MiB）；`0` 表示按可用内存自动确定 | `0`（自动） |
+| `--builder-workers` | 并行写入进程数（同 `generate.py`） | 1 |
 | `--workers` / `--chunk-size` / `--batch-size` | 同 `generate.py`，受内存自适应预算与 CPU 约束 | 30 / 500000 / 200000 |
 
 > `--shards` 必须与生成原库时一致，否则分片定位错乱会导致查询查不到。`--prefix` 与 `--prefix-file` 可同时使用，至少需指定其一。

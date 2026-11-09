@@ -14,7 +14,7 @@ from pathlib import Path
 
 from generate import (
     MIB, check_sm3, clamp_params, load_prefixes, plan_budget,
-    print_budget, resolve_workers, stream_generate,
+    print_budget, resolve_builders, resolve_workers, stream_generate,
 )
 
 DEFAULT_DB_ROOT = "/data/rocksdb/phone_sm3"
@@ -62,6 +62,8 @@ def main():
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--mem-budget", type=int, default=0, metavar="MIB",
                         help="共享缓存预算（MiB）；0 表示按可用内存自动确定")
+    parser.add_argument("--builder-workers", type=int, default=1,
+                        help="并行写入进程数（按 shard 分配）；>1 时缓存预算在各进程间平分")
     parser.add_argument("--shards", type=int, default=DEFAULT_SHARDS,
                         help="必须与原库相同（1~256 范围内的 2 的幂）")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
@@ -70,7 +72,7 @@ def main():
 
     if args.shards <= 0 or args.shards > 256 or args.shards & (args.shards - 1):
         parser.error("--shards 必须是 1~256 范围内的 2 的幂")
-    for name in ("workers", "chunk_size", "batch_size"):
+    for name in ("workers", "chunk_size", "batch_size", "builder_workers"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} 必须大于 0")
     if args.mem_budget < 0:
@@ -80,11 +82,17 @@ def main():
 
     budget, source = plan_budget(args.mem_budget)
     workers = resolve_workers(args.workers)
+    builders = resolve_builders(args.builder_workers, args.shards)
     chunk_size, batch_size = clamp_params(budget, workers, args.chunk_size, args.batch_size)
     if (workers, chunk_size, batch_size) != (args.workers, args.chunk_size, args.batch_size):
         print(f"[INFO] 根据缓存预算与 CPU 调整参数: workers={workers}, "
               f"chunk-size={chunk_size}, batch-size={batch_size}")
+    if builders != args.builder_workers:
+        print(f"[INFO] builder-workers 收敛到 shard 数: builder-workers={builders}")
     print_budget(budget, source)
+    if builders > 1:
+        print(f"[INFO] {builders} 个并行写入进程，每个约 "
+              f"{budget.cache_size // builders // MIB} MiB cache（预算按 builder 平分）")
 
     db_root = Path(args.db_root)
     if db_root.exists():
@@ -99,7 +107,7 @@ def main():
     print(f"[INFO] 待追加号段 ({len(prefixes)}): {', '.join(prefixes)}")
 
     stream_generate(prefixes, workers, args.shards, chunk_size, batch_size,
-                    args.db_root, budget)
+                    args.db_root, budget, builders)
     print("APPEND COMPLETED")
 
 

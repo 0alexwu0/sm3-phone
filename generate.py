@@ -6,6 +6,7 @@ import time
 from collections import namedtuple
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
+from queue import Empty, Full
 
 from rocksdict import (
     BlockBasedOptions, Cache, Options, Rdict, WriteBatch,
@@ -137,22 +138,37 @@ def create_tasks(prefixes, chunk_size):
             yield prefix, start, min(start + chunk_size, count), suffix_width
 
 
-def hash_chunk(task):
-    """只返回一个有界数据块，不写临时文件，也不打开 RocksDB。"""
+def hash_chunk(task, shards=1, builders=1):
+    """计算一块号码的 SM3，不写临时文件，也不打开 RocksDB。
+
+    builders == 1 时返回单个扁平数据块（与单写入进程路径一致）。
+    builders > 1 时在 worker 内按 ``(digest[0] & mask) % builders`` 直接分桶，
+    返回长度为 builders 的块列表，主进程无需再逐条遍历路由。
+    """
     prefix, start, end, suffix_width = task
-    data = bytearray((end - start) * RECORD_SIZE)
     prefix_bytes = prefix.encode("ascii")
     sm3 = hashlib.new  # 局部绑定，减少属性查找
-    offset = 0
+    if builders == 1:
+        data = bytearray((end - start) * RECORD_SIZE)
+        offset = 0
+        for suffix in range(start, end):
+            phone = prefix_bytes + str(suffix).zfill(suffix_width).encode("ascii")
+            data[offset:offset + 32] = sm3("sm3", phone).digest()
+            data[offset + 32:offset + RECORD_SIZE] = phone
+            offset += RECORD_SIZE
+        return data
+    mask = shards - 1
+    buckets = [bytearray() for _ in range(builders)]
     for suffix in range(start, end):
         phone = prefix_bytes + str(suffix).zfill(suffix_width).encode("ascii")
-        data[offset:offset + 32] = sm3("sm3", phone).digest()
-        data[offset + 32:offset + RECORD_SIZE] = phone
-        offset += RECORD_SIZE
-    return data
+        digest = sm3("sm3", phone).digest()
+        bucket = buckets[(digest[0] & mask) % builders]
+        bucket += digest
+        bucket += phone
+    return buckets
 
 
-def create_rocksdb_options(cache, write_buffer_manager, shards, memtable_limit):
+def create_rocksdb_options(cache, write_buffer_manager, shard_divisor, memtable_limit):
     opts = Options(raw_mode=True)
     opts.create_if_missing(True)
     # 必须共用同一对象；缺少这些 API 时直接报错，不静默放弃限制。
@@ -164,7 +180,7 @@ def create_rocksdb_options(cache, write_buffer_manager, shards, memtable_limit):
     table.set_pin_top_level_index_and_filter(False)
     opts.set_block_based_table_factory(table)
     # memtable 越大 → flush 越少；总量仍由 WriteBufferManager 封顶在 memtable_limit。
-    memtable_size = min(PER_MEMTABLE_MAX, max(8 * MIB, memtable_limit // (shards * 2)))
+    memtable_size = min(PER_MEMTABLE_MAX, max(8 * MIB, memtable_limit // (max(1, shard_divisor) * 2)))
     memtable_size = min(memtable_size, memtable_limit)
     opts.set_write_buffer_size(memtable_size)
     opts.set_max_write_buffer_number(2)
@@ -183,9 +199,12 @@ def create_rocksdb_options(cache, write_buffer_manager, shards, memtable_limit):
 class ShardWriter:
     """单一写入进程拥有所有分片，使共享缓存预算真正生效。"""
 
-    def __init__(self, db_root, shards, batch_size, budget):
+    def __init__(self, db_root, shards, batch_size, budget, local_shards=None):
         self.db_root = Path(db_root)
         self.shards = shards
+        # 本写入进程实际会打开的 shard 数，仅用于 memtable 分配；
+        # 分片定位仍用总 shard 数 self.shards。
+        self.local_shards = local_shards if local_shards else shards
         self.batch_size = batch_size
         self.memtable_limit = budget.memtable_limit
         self.databases = {}
@@ -207,7 +226,7 @@ class ShardWriter:
     def get_db(self, shard):
         if shard not in self.databases:
             options = create_rocksdb_options(
-                self.cache, self.write_buffer_manager, self.shards,
+                self.cache, self.write_buffer_manager, self.local_shards,
                 self.memtable_limit,
             )
             path = self.db_root / f"shard_{shard:02d}"
@@ -262,16 +281,179 @@ class ShardWriter:
             raise first_error
 
 
-def stream_generate(prefixes, workers, shards, chunk_size, batch_size, db_root, budget):
+def resolve_builders(requested, shards):
+    """builder 不能多于 shard 数，也至少为 1。"""
+    return max(1, min(requested, shards))
+
+
+def split_budget(budget, builders):
+    """多写入进程无法共享同一 Cache，按 builder 数平分缓存/ memtable 预算。
+
+    流水线预算留在主进程（负责分发），不分给 builder。
+    """
+    if builders <= 1:
+        return budget
+    return budget._replace(
+        total=budget.total // builders,
+        cache_size=budget.cache_size // builders,
+        memtable_limit=budget.memtable_limit // builders,
+        pipeline_budget=0,
+        headroom=budget.headroom // builders,
+    )
+
+
+def owned_shard_count(shards, builders, builder_id):
+    """builder_id 负责所有满足 shard % builders == builder_id 的 shard。"""
+    return len(range(builder_id, shards, builders))
+
+
+def _builder_loop(db_root, shards, batch_size, budget, local_shards,
+                  task_queue, result_queue):
+    """独立写入进程：从队列取出已路由到本进程 shard 的数据块并写入。"""
+    writer = ShardWriter(db_root, shards, batch_size, budget, local_shards)
+    written = 0
+    try:
+        while True:
+            item = task_queue.get()
+            if item is None:
+                break
+            data, expected_shard = item
+            written += writer.write_records(data, expected_shard=expected_shard)
+        writer.close()
+    except Exception as exc:  # 把错误回传主进程，不静默吞掉
+        result_queue.put(("error", written, repr(exc)))
+        return
+    result_queue.put(("ok", written, None))
+
+
+class WriterPool:
+    """按 shard 将写入分配给一个或多个独立进程。
+
+    builders == 1 时直接复用单个 ShardWriter（零 IPC、完整共享预算），
+    与单写入进程路径完全等价；builders > 1 时启动多个写入进程并行写各自 shard。
+    """
+
+    QUEUE_MAXSIZE = 4  # 有界队列 → 写入跟不上时对主进程产生背压
+
+    def __init__(self, db_root, shards, batch_size, budget, builders):
+        self.shards = shards
+        self.builders = builders
+        self._single = None
+        self._procs = []
+        self._queues = []
+        self._result_queue = None
+        if builders == 1:
+            self._single = ShardWriter(db_root, shards, batch_size, budget)
+            return
+        per_builder = split_budget(budget, builders)
+        ctx = mp.get_context("spawn")
+        self._result_queue = ctx.Queue()
+        self._early_results = []
+        for builder_id in range(builders):
+            task_queue = ctx.Queue(maxsize=self.QUEUE_MAXSIZE)
+            local_shards = owned_shard_count(shards, builders, builder_id)
+            proc = ctx.Process(
+                target=_builder_loop,
+                args=(db_root, shards, batch_size, per_builder, local_shards,
+                      task_queue, self._result_queue),
+                daemon=False,
+            )
+            proc.start()
+            self._queues.append(task_queue)
+            self._procs.append(proc)
+
+    def _dispatch(self, builder_id, item):
+        """带超时的入队：避免某个 builder 崩溃后主进程在满队列上永久阻塞。"""
+        task_queue = self._queues[builder_id]
+        while True:
+            try:
+                task_queue.put(item, timeout=1.0)
+                return
+            except Full:
+                # builder 存活会持续消费队列、最终腾出空间；只在它已故障时才报错。
+                self._raise_if_failed(builder_id)
+
+    def _drain_results(self):
+        try:
+            while True:
+                self._early_results.append(self._result_queue.get_nowait())
+        except Empty:
+            pass
+
+    def _raise_if_failed(self, builder_id):
+        # builder 软错误：正常退出并把 ("error", ...) 放进结果队列。
+        self._drain_results()
+        for status, _, msg in self._early_results:
+            if status == "error":
+                raise RuntimeError(f"Builder 进程写入失败: {msg}")
+        # builder 硬崩溃：非 0 退出码。入队目标崩溃时必须报错，否则会死等空间。
+        proc = self._procs[builder_id]
+        if proc.exitcode not in (None, 0):
+            raise RuntimeError(f"Builder 进程异常退出: exitcode={proc.exitcode}")
+
+    def consume(self, result):
+        """写入一个 hash 结果：builders==1 为扁平块，否则为按 builder 分好的块列表。"""
+        if self._single is not None:
+            return self._single.write_records(result)
+        written = 0
+        for builder_id, block in enumerate(result):
+            if block:
+                self._dispatch(builder_id, (block, None))
+                written += len(block) // RECORD_SIZE
+        return written
+
+    def write_block(self, data, expected_shard):
+        """导入路径：按 shard 把整块路由给对应 builder。"""
+        if self._single is not None:
+            return self._single.write_records(data, expected_shard=expected_shard)
+        builder_id = expected_shard % self.builders
+        self._dispatch(builder_id, (data, expected_shard))
+        return len(data) // RECORD_SIZE
+
+    def close(self, expected_records=None):
+        if self._single is not None:
+            self._single.close()
+            return
+        # 只向仍存活的 builder 可靠投递哨兵；已故障的不投，避免阻塞。
+        for builder_id, task_queue in enumerate(self._queues):
+            proc = self._procs[builder_id]
+            while proc.is_alive():
+                try:
+                    task_queue.put(None, timeout=0.5)
+                    break
+                except Full:
+                    self._drain_results()
+        # 结果项很小，边排空边 join 不会因 feeder 缓冲而死锁。
+        for proc in self._procs:
+            while proc.is_alive():
+                self._drain_results()
+                proc.join(timeout=0.5)
+        self._drain_results()
+        results = self._early_results
+        errors = [msg for status, _, msg in results if status == "error"]
+        written = sum(count for _, count, _ in results)
+        failed = [proc.exitcode for proc in self._procs if proc.exitcode]
+        if errors:
+            raise RuntimeError(f"Builder 进程写入失败: {errors[0]}")
+        if failed:
+            raise RuntimeError(f"Builder 进程异常退出: exitcode={failed[0]}")
+        if expected_records is not None and written != expected_records:
+            raise RuntimeError(
+                f"Builder 写入记录数不符: {written} != {expected_records}")
+
+
+def stream_generate(prefixes, workers, shards, chunk_size, batch_size, db_root,
+                    budget, builders=1):
     total = sum(10 ** (11 - len(prefix)) for prefix in prefixes)
     tasks = iter(create_tasks(prefixes, chunk_size))
     worker_count = min(workers, sum(
         (10 ** (11 - len(prefix)) + chunk_size - 1) // chunk_size
         for prefix in prefixes
     ))
-    writer = ShardWriter(db_root, shards, batch_size, budget)
+    writer = WriterPool(db_root, shards, batch_size, budget, builders)
     processed = 0
     begin = time.monotonic()
+    closed = False
     try:
         # spawn 同时支持 Linux/Windows，不继承已打开的 DB/线程。
         with ProcessPoolExecutor(
@@ -284,7 +466,7 @@ def stream_generate(prefixes, workers, shards, chunk_size, batch_size, db_root, 
                     task = next(tasks, None)
                     if task is None:
                         break
-                    pending.add(pool.submit(hash_chunk, task))
+                    pending.add(pool.submit(hash_chunk, task, shards, builders))
 
             fill_pending()
             while pending:
@@ -293,7 +475,7 @@ def stream_generate(prefixes, workers, shards, chunk_size, batch_size, db_root, 
                 while completed:
                     future = completed.pop()
                     data = future.result()
-                    processed += writer.write_records(data)
+                    processed += writer.consume(data)
                     del data, future
                 fill_pending()
                 elapsed = max(time.monotonic() - begin, 1e-9)
@@ -305,22 +487,30 @@ def stream_generate(prefixes, workers, shards, chunk_size, batch_size, db_root, 
                 )
         if processed != total:
             raise RuntimeError(f"Record count mismatch: {processed} != {total}")
-    finally:
         print()
-        writer.close()
+        writer.close(expected_records=processed)
+        closed = True
+    finally:
+        if not closed:
+            print()
+            try:
+                writer.close()
+            except Exception:
+                pass
     print(f"[DONE] {processed:,} records, {time.monotonic() - begin:.1f}s")
     return processed
 
 
-def import_spool(tmp_root, shards, batch_size, db_root, budget):
+def import_spool(tmp_root, shards, batch_size, db_root, budget, builders=1):
     """兼容旧 --phase2-only；逐块导入已有文件，保留源文件。"""
     root = Path(tmp_root)
     if not root.is_dir():
         raise ValueError(f"Temporary directory does not exist: {root}")
-    writer = ShardWriter(db_root, shards, batch_size, budget)
+    writer = WriterPool(db_root, shards, batch_size, budget, builders)
     records = 0
     files = 0
     read_size = (MAX_CHUNK_BYTES // RECORD_SIZE) * RECORD_SIZE
+    closed = False
     try:
         for worker_dir in root.iterdir():
             if not worker_dir.is_dir():
@@ -336,13 +526,19 @@ def import_spool(tmp_root, shards, batch_size, db_root, budget):
                         data = source.read(read_size)
                         if not data:
                             break
-                        records += writer.write_records(data, expected_shard=shard)
+                        records += writer.write_block(data, shard)
                 files += 1
                 print(f"[IMPORT] {path.name}: total={records:,}")
         if files == 0:
             raise RuntimeError(f"No spool files found in {root}")
+        writer.close(expected_records=records)
+        closed = True
     finally:
-        writer.close()
+        if not closed:
+            try:
+                writer.close()
+            except Exception:
+                pass
     print(f"[DONE] imported {records:,} records; source files retained")
     return records
 
@@ -367,8 +563,8 @@ def main():
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--mem-budget", type=int, default=0, metavar="MIB",
                         help="共享缓存预算（MiB）；0 表示按可用内存自动确定")
-    parser.add_argument("--builder-workers", type=int, default=None,
-                        help="Deprecated: all shards now share one writer/cache")
+    parser.add_argument("--builder-workers", type=int, default=1,
+                        help="并行写入进程数（按 shard 分配）；>1 时缓存预算在各进程间平分")
     parser.add_argument("--shards", type=int, default=DEFAULT_SHARDS)
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
@@ -379,7 +575,7 @@ def main():
     args = parser.parse_args()
     if args.shards <= 0 or args.shards > 256 or args.shards & (args.shards - 1):
         parser.error("--shards 必须是 1~256 范围内的 2 的幂")
-    for name in ("workers", "chunk_size", "batch_size"):
+    for name in ("workers", "chunk_size", "batch_size", "builder_workers"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} 必须大于 0")
     if args.mem_budget < 0:
@@ -389,23 +585,27 @@ def main():
 
     budget, source = plan_budget(args.mem_budget)
     workers = resolve_workers(args.workers)
+    builders = resolve_builders(args.builder_workers, args.shards)
     chunk_size, batch_size = clamp_params(budget, workers, args.chunk_size, args.batch_size)
     if (workers, chunk_size, batch_size) != (args.workers, args.chunk_size, args.batch_size):
         print(f"[INFO] 根据缓存预算与 CPU 调整参数: workers={workers}, "
               f"chunk-size={chunk_size}, batch-size={batch_size}")
-    if args.builder_workers is not None:
-        print("[INFO] --builder-workers 已弃用；所有分片由同一进程写入以共享缓存")
+    if builders != args.builder_workers:
+        print(f"[INFO] builder-workers 收敛到 shard 数: builder-workers={builders}")
     print_budget(budget, source)
+    if builders > 1:
+        print(f"[INFO] {builders} 个并行写入进程，每个约 "
+              f"{budget.cache_size // builders // MIB} MiB cache（预算按 builder 平分）")
 
     if args.phase2_only:
-        import_spool(args.tmp_root, args.shards, batch_size, args.db_root, budget)
+        import_spool(args.tmp_root, args.shards, batch_size, args.db_root, budget, builders)
     else:
         check_sm3()
         prefixes = load_prefixes(args.prefix_file)
         if not prefixes:
             raise RuntimeError("prefix 文件中没有有效前缀")
         stream_generate(prefixes, workers, args.shards, chunk_size, batch_size,
-                        args.db_root, budget)
+                        args.db_root, budget, builders)
     print("BUILD COMPLETED")
 
 
