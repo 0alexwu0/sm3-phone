@@ -13,15 +13,15 @@ import argparse
 from pathlib import Path
 
 from generate import (
-    CACHE_LIMIT, MAX_BATCH_SIZE, MAX_CHUNK_BYTES, MAX_WORKERS,
-    MEMTABLE_LIMIT, MIB, PIPELINE_BUDGET, RECORD_SIZE, ROCKSDB_CACHE_SIZE,
-    check_sm3, load_prefixes, stream_generate,
+    MIB, check_sm3, clamp_params, load_prefixes, plan_budget,
+    print_budget, resolve_workers, stream_generate,
 )
 
 DEFAULT_DB_ROOT = "/data/rocksdb/phone_sm3"
 DEFAULT_SHARDS = 32
 DEFAULT_CHUNK_SIZE = 500_000
 DEFAULT_BATCH_SIZE = 200_000
+DEFAULT_WORKERS = 30
 
 
 def valid_prefix(prefix):
@@ -51,7 +51,7 @@ def collect_prefixes(cli_prefixes, prefix_file):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="追加指定号段到既有 SM3 Phone RocksDB 库（1 GiB 缓存预算）"
+        description="追加指定号段到既有 SM3 Phone RocksDB 库（内存自适应缓存预算）"
     )
     parser.add_argument("--prefix", action="append", metavar="PREFIX",
                         help="要追加的号段前缀，可重复指定（如 --prefix 166 --prefix 199）")
@@ -59,7 +59,9 @@ def main():
                         help="号段前缀文件（每行一个，与 --prefix 合并去重）")
     parser.add_argument("--db-root", default=DEFAULT_DB_ROOT,
                         help="既有 RocksDB 目录；不存在则新建")
-    parser.add_argument("--workers", type=int, default=30)
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    parser.add_argument("--mem-budget", type=int, default=0, metavar="MIB",
+                        help="共享缓存预算（MiB）；0 表示按可用内存自动确定")
     parser.add_argument("--shards", type=int, default=DEFAULT_SHARDS,
                         help="必须与原库相同（1~256 范围内的 2 的幂）")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
@@ -71,19 +73,18 @@ def main():
     for name in ("workers", "chunk_size", "batch_size"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} 必须大于 0")
+    if args.mem_budget < 0:
+        parser.error("--mem-budget 不能为负")
     if not args.prefix and not args.prefix_file:
         parser.error("必须通过 --prefix 和/或 --prefix-file 指定要追加的号段")
 
-    workers = min(args.workers, MAX_WORKERS)
-    chunk_size = min(args.chunk_size, MAX_CHUNK_BYTES // RECORD_SIZE)
-    batch_size = min(args.batch_size, MAX_BATCH_SIZE)
+    budget, source = plan_budget(args.mem_budget)
+    workers = resolve_workers(args.workers)
+    chunk_size, batch_size = clamp_params(budget, workers, args.chunk_size, args.batch_size)
     if (workers, chunk_size, batch_size) != (args.workers, args.chunk_size, args.batch_size):
-        print(f"[INFO] 根据缓存预算限制参数: workers={workers}, "
+        print(f"[INFO] 根据缓存预算与 CPU 调整参数: workers={workers}, "
               f"chunk-size={chunk_size}, batch-size={batch_size}")
-    print(f"[INFO] Cache budget: {CACHE_LIMIT // MIB} MiB total; "
-          f"{ROCKSDB_CACHE_SIZE // MIB} MiB shared RocksDB cache "
-          f"(includes up to {MEMTABLE_LIMIT // MIB} MiB memtables); "
-          f"{PIPELINE_BUDGET // MIB} MiB pipeline reserve; 128 MiB headroom")
+    print_budget(budget, source)
 
     db_root = Path(args.db_root)
     if db_root.exists():
@@ -97,7 +98,8 @@ def main():
         raise RuntimeError("没有有效的号段可追加")
     print(f"[INFO] 待追加号段 ({len(prefixes)}): {', '.join(prefixes)}")
 
-    stream_generate(prefixes, workers, args.shards, chunk_size, batch_size, args.db_root)
+    stream_generate(prefixes, workers, args.shards, chunk_size, batch_size,
+                    args.db_root, budget)
     print("APPEND COMPLETED")
 
 

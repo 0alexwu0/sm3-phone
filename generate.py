@@ -1,7 +1,9 @@
 import argparse
 import hashlib
 import multiprocessing as mp
+import os
 import time
+from collections import namedtuple
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
@@ -16,22 +18,89 @@ DEFAULT_TMP_ROOT = "/data/rocksdb_build_tmp"
 DEFAULT_SHARDS = 32
 DEFAULT_CHUNK_SIZE = 500_000
 DEFAULT_BATCH_SIZE = 200_000
+DEFAULT_WORKERS = 30
 RECORD_SIZE = 43  # 32 bytes SM3 + 11 bytes phone
 MIB = 1024 * 1024
 
-# 所有分片共用预算，不能把 1 GiB 分别分配给每个 DB/worker。
-# memtable 计入共享 block cache，不能重复相加。
-# 768 MiB DB cache + 128 MiB 流水线预算 + 128 MiB 余量 = 1 GiB。
-# 这是缓存预算，不是进程 RSS 上限；Python、compaction 和 OS 缓存另计。
-CACHE_LIMIT = 1024 * MIB
-ROCKSDB_CACHE_SIZE = 768 * MIB
-MEMTABLE_LIMIT = 512 * MIB
-PIPELINE_BUDGET = 128 * MIB
-MAX_CHUNK_BYTES = MIB
-MAX_BATCH_SIZE = 8192
+# 缓存预算默认按「可用内存 × MEM_FRACTION」自动确定，也可用 --mem-budget 显式指定。
+# 预算在所有分片间共享：内存越大 → 更大的 block cache / memtable、更大的计算块与
+# WriteBatch、更少的 IPC 往返与 flush/compaction，从而更快生成。
+# 这是缓存预算，不是进程 RSS 上限；Python 运行时、compaction 与 OS 页缓存另计。
+MEM_FRACTION = 0.8          # 自动模式下占用「可用内存」的比例
+MIN_BUDGET = 512 * MIB      # 预算下限，避免 RocksDB 参数退化
+FALLBACK_BUDGET = 1024 * MIB  # 无法探测可用内存时退回原 1 GiB 基线
+
+MIN_CHUNK_BYTES = MIB       # 单个计算块的字节下限
+MAX_CHUNK_BYTES = 64 * MIB  # 单个计算块的字节上限（约束 IPC 峰值）
+MAX_BATCH_BYTES = 32 * MIB  # 单个 WriteBatch 的字节上限（约束写入峰值）
+PER_MEMTABLE_MAX = 64 * MIB  # 单个 memtable 的大小上限
 # 为 worker 结果、序列化、IPC 和父进程结果的副本预留空间。
 IPC_COPY_FACTOR = 4
-MAX_WORKERS = PIPELINE_BUDGET // (MAX_CHUNK_BYTES * IPC_COPY_FACTOR)
+
+Budget = namedtuple(
+    "Budget", "total cache_size memtable_limit pipeline_budget headroom"
+)
+
+
+def detect_available_memory():
+    """读取 /proc/meminfo 的可用内存（字节）；不可用时返回 None。"""
+    try:
+        info = {}
+        with open("/proc/meminfo", "r") as source:
+            for line in source:
+                key, _, rest = line.partition(":")
+                parts = rest.split()
+                if parts:
+                    info[key] = int(parts[0]) * 1024  # kB -> bytes
+        return info.get("MemAvailable") or info.get("MemFree")
+    except (OSError, ValueError):
+        return None
+
+
+def plan_budget(mem_budget_mib=0):
+    """确定共享缓存预算并按固定比例拆分为各部分。
+
+    沿用原 1 GiB 基线的比例（cache 75% / memtable 为 cache 的 2/3 / pipeline
+    12.5% / 余量 12.5%），但总量随可用内存或 --mem-budget 伸缩。
+    """
+    if mem_budget_mib and mem_budget_mib > 0:
+        total = mem_budget_mib * MIB
+        source = "--mem-budget"
+    else:
+        available = detect_available_memory()
+        if available:
+            total = int(available * MEM_FRACTION)
+            source = f"auto({MEM_FRACTION:.0%} of available)"
+        else:
+            total = FALLBACK_BUDGET
+            source = "fallback"
+    total = max(total, MIN_BUDGET)
+    cache = total * 3 // 4
+    memtable = cache * 2 // 3
+    pipeline = total // 8
+    headroom = total - cache - pipeline
+    budget = Budget(total, cache, memtable, pipeline, headroom)
+    return budget, source
+
+
+def resolve_workers(requested):
+    """SM3 计算是 CPU 密集型，worker 数超过 CPU 核数只会增加开销。"""
+    cpu = os.cpu_count() or 1
+    return max(1, min(requested, cpu))
+
+
+def clamp_params(budget, workers, chunk_size, batch_size):
+    """根据预算与 worker 数推导计算块与写批的上限。
+
+    pipeline 预算要容纳所有在途的 worker 结果及其副本，因此 worker 越少，
+    单块可以越大（更少 IPC 往返）；worker 越多，单块相应变小。
+    """
+    chunk_byte_cap = budget.pipeline_budget // (workers * IPC_COPY_FACTOR)
+    chunk_byte_cap = max(MIN_CHUNK_BYTES, min(MAX_CHUNK_BYTES, chunk_byte_cap))
+    chunk_size = max(1, min(chunk_size, chunk_byte_cap // RECORD_SIZE))
+    batch_cap = max(1, min(chunk_size, MAX_BATCH_BYTES // RECORD_SIZE))
+    batch_size = max(1, min(batch_size, batch_cap))
+    return chunk_size, batch_size
 
 
 def check_sm3():
@@ -73,16 +142,17 @@ def hash_chunk(task):
     prefix, start, end, suffix_width = task
     data = bytearray((end - start) * RECORD_SIZE)
     prefix_bytes = prefix.encode("ascii")
+    sm3 = hashlib.new  # 局部绑定，减少属性查找
     offset = 0
     for suffix in range(start, end):
         phone = prefix_bytes + str(suffix).zfill(suffix_width).encode("ascii")
-        data[offset:offset + 32] = hashlib.new("sm3", phone).digest()
+        data[offset:offset + 32] = sm3("sm3", phone).digest()
         data[offset + 32:offset + RECORD_SIZE] = phone
         offset += RECORD_SIZE
     return data
 
 
-def create_rocksdb_options(cache, write_buffer_manager, shards):
+def create_rocksdb_options(cache, write_buffer_manager, shards, memtable_limit):
     opts = Options(raw_mode=True)
     opts.create_if_missing(True)
     # 必须共用同一对象；缺少这些 API 时直接报错，不静默放弃限制。
@@ -93,11 +163,14 @@ def create_rocksdb_options(cache, write_buffer_manager, shards):
     table.set_pin_l0_filter_and_index_blocks_in_cache(False)
     table.set_pin_top_level_index_and_filter(False)
     opts.set_block_based_table_factory(table)
-    memtable_size = min(8 * MIB, MEMTABLE_LIMIT // (shards * 2))
+    # memtable 越大 → flush 越少；总量仍由 WriteBufferManager 封顶在 memtable_limit。
+    memtable_size = min(PER_MEMTABLE_MAX, max(8 * MIB, memtable_limit // (shards * 2)))
+    memtable_size = min(memtable_size, memtable_limit)
     opts.set_write_buffer_size(memtable_size)
     opts.set_max_write_buffer_number(2)
     opts.set_min_write_buffer_number_to_merge(1)
-    opts.set_max_background_jobs(2)
+    # 更多后台线程加快 flush/compaction，跟上更大的内存吞吐。
+    opts.set_max_background_jobs(max(2, os.cpu_count() or 2))
     opts.set_max_open_files(64)
     opts.set_target_file_size_base(64 * MIB)
     opts.set_level_compaction_dynamic_level_bytes(True)
@@ -110,15 +183,16 @@ def create_rocksdb_options(cache, write_buffer_manager, shards):
 class ShardWriter:
     """单一写入进程拥有所有分片，使共享缓存预算真正生效。"""
 
-    def __init__(self, db_root, shards, batch_size):
+    def __init__(self, db_root, shards, batch_size, budget):
         self.db_root = Path(db_root)
         self.shards = shards
         self.batch_size = batch_size
+        self.memtable_limit = budget.memtable_limit
         self.databases = {}
-        self.cache = Cache(ROCKSDB_CACHE_SIZE)
+        self.cache = Cache(budget.cache_size)
         self.write_buffer_manager = (
             WriteBufferManager.new_write_buffer_manager_with_cache(
-                MEMTABLE_LIMIT, True, self.cache
+                budget.memtable_limit, True, self.cache
             )
         )
         self.write_options = WriteOptions()
@@ -133,7 +207,8 @@ class ShardWriter:
     def get_db(self, shard):
         if shard not in self.databases:
             options = create_rocksdb_options(
-                self.cache, self.write_buffer_manager, self.shards
+                self.cache, self.write_buffer_manager, self.shards,
+                self.memtable_limit,
             )
             path = self.db_root / f"shard_{shard:02d}"
             path.mkdir(parents=True, exist_ok=True)
@@ -187,14 +262,14 @@ class ShardWriter:
             raise first_error
 
 
-def stream_generate(prefixes, workers, shards, chunk_size, batch_size, db_root):
+def stream_generate(prefixes, workers, shards, chunk_size, batch_size, db_root, budget):
     total = sum(10 ** (11 - len(prefix)) for prefix in prefixes)
     tasks = iter(create_tasks(prefixes, chunk_size))
     worker_count = min(workers, sum(
         (10 ** (11 - len(prefix)) + chunk_size - 1) // chunk_size
         for prefix in prefixes
     ))
-    writer = ShardWriter(db_root, shards, batch_size)
+    writer = ShardWriter(db_root, shards, batch_size, budget)
     processed = 0
     begin = time.monotonic()
     try:
@@ -237,14 +312,15 @@ def stream_generate(prefixes, workers, shards, chunk_size, batch_size, db_root):
     return processed
 
 
-def import_spool(tmp_root, shards, batch_size, db_root):
+def import_spool(tmp_root, shards, batch_size, db_root, budget):
     """兼容旧 --phase2-only；逐块导入已有文件，保留源文件。"""
     root = Path(tmp_root)
     if not root.is_dir():
         raise ValueError(f"Temporary directory does not exist: {root}")
-    writer = ShardWriter(db_root, shards, batch_size)
+    writer = ShardWriter(db_root, shards, batch_size, budget)
     records = 0
     files = 0
+    read_size = (MAX_CHUNK_BYTES // RECORD_SIZE) * RECORD_SIZE
     try:
         for worker_dir in root.iterdir():
             if not worker_dir.is_dir():
@@ -257,7 +333,7 @@ def import_spool(tmp_root, shards, batch_size, db_root):
                     raise RuntimeError(f"Corrupted spool file: {path}")
                 with path.open("rb", buffering=0) as source:
                     while True:
-                        data = source.read((MAX_CHUNK_BYTES // RECORD_SIZE) * RECORD_SIZE)
+                        data = source.read(read_size)
                         if not data:
                             break
                         records += writer.write_records(data, expected_shard=shard)
@@ -271,13 +347,26 @@ def import_spool(tmp_root, shards, batch_size, db_root):
     return records
 
 
+def print_budget(budget, source):
+    print(
+        f"[INFO] Cache budget: {budget.total // MIB} MiB total ({source}); "
+        f"{budget.cache_size // MIB} MiB shared RocksDB cache "
+        f"(includes up to {budget.memtable_limit // MIB} MiB memtables); "
+        f"{budget.pipeline_budget // MIB} MiB pipeline reserve; "
+        f"{budget.headroom // MIB} MiB headroom"
+    )
+    print("[INFO] Cache budget excludes process runtime, compaction allocations and OS page cache")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Streaming SM3 Phone RocksDB Builder (1 GiB cache budget)")
+    parser = argparse.ArgumentParser(description="Streaming SM3 Phone RocksDB Builder (memory-adaptive cache budget)")
     parser.add_argument("--prefix-file")
     parser.add_argument("--db-root", default=DEFAULT_DB_ROOT)
     parser.add_argument("--tmp-root", default=DEFAULT_TMP_ROOT,
                         help="Only used by --phase2-only")
-    parser.add_argument("--workers", type=int, default=30)
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    parser.add_argument("--mem-budget", type=int, default=0, metavar="MIB",
+                        help="共享缓存预算（MiB）；0 表示按可用内存自动确定")
     parser.add_argument("--builder-workers", type=int, default=None,
                         help="Deprecated: all shards now share one writer/cache")
     parser.add_argument("--shards", type=int, default=DEFAULT_SHARDS)
@@ -293,31 +382,30 @@ def main():
     for name in ("workers", "chunk_size", "batch_size"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} 必须大于 0")
+    if args.mem_budget < 0:
+        parser.error("--mem-budget 不能为负")
     if not args.phase2_only and not args.prefix_file:
         parser.error("生成模式必须指定 --prefix-file")
 
-    workers = min(args.workers, MAX_WORKERS)
-    chunk_size = min(args.chunk_size, MAX_CHUNK_BYTES // RECORD_SIZE)
-    batch_size = min(args.batch_size, MAX_BATCH_SIZE)
+    budget, source = plan_budget(args.mem_budget)
+    workers = resolve_workers(args.workers)
+    chunk_size, batch_size = clamp_params(budget, workers, args.chunk_size, args.batch_size)
     if (workers, chunk_size, batch_size) != (args.workers, args.chunk_size, args.batch_size):
-        print(f"[INFO] 根据缓存预算限制参数: workers={workers}, "
+        print(f"[INFO] 根据缓存预算与 CPU 调整参数: workers={workers}, "
               f"chunk-size={chunk_size}, batch-size={batch_size}")
     if args.builder_workers is not None:
         print("[INFO] --builder-workers 已弃用；所有分片由同一进程写入以共享缓存")
-    print(f"[INFO] Cache budget: {CACHE_LIMIT // MIB} MiB total; "
-          f"{ROCKSDB_CACHE_SIZE // MIB} MiB shared RocksDB cache "
-          f"(includes up to {MEMTABLE_LIMIT // MIB} MiB memtables); "
-          f"{PIPELINE_BUDGET // MIB} MiB pipeline reserve; 128 MiB headroom")
-    print("[INFO] Cache budget excludes process runtime, compaction allocations and OS page cache")
+    print_budget(budget, source)
 
     if args.phase2_only:
-        import_spool(args.tmp_root, args.shards, batch_size, args.db_root)
+        import_spool(args.tmp_root, args.shards, batch_size, args.db_root, budget)
     else:
         check_sm3()
         prefixes = load_prefixes(args.prefix_file)
         if not prefixes:
             raise RuntimeError("prefix 文件中没有有效前缀")
-        stream_generate(prefixes, workers, args.shards, chunk_size, batch_size, args.db_root)
+        stream_generate(prefixes, workers, args.shards, chunk_size, batch_size,
+                        args.db_root, budget)
     print("BUILD COMPLETED")
 
 

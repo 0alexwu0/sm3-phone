@@ -30,13 +30,15 @@
 
 > SM3 需要底层 OpenSSL 支持（`hashlib.new("sm3", ...)`）。较新的 OpenSSL 3.x 默认支持。
 
-### 内存预算
+### 内存预算（自适应）
 
-生成阶段以约 **1 GiB 缓存预算**运行，并据此自动限制相关参数：
+生成阶段会**按机器可用内存自动确定缓存预算**，内存越大、生成越快——更大的 block cache / memtable、更大的计算块与 WriteBatch，意味着更少的 IPC 往返和 flush / compaction。
 
-- 768 MiB 共享 RocksDB block cache（其中含最多 512 MiB memtable）+ 128 MiB 流水线预算 + 128 MiB 余量。
-- 若 `--workers` / `--chunk-size` / `--batch-size` 超出预算允许的上限，程序会自动下调并打印 `[INFO] 根据缓存预算限制参数: ...`。
+- **预算来源**：默认读取 `/proc/meminfo` 的 `MemAvailable`，取其约 **80%** 作为共享预算（下限 512 MiB；无法探测时退回 1 GiB 基线）。可用 `--mem-budget <MiB>` 显式指定。
+- **预算拆分**（沿用原比例，随总量伸缩）：75% 共享 RocksDB block cache（其中含约 2/3 的 memtable）+ 12.5% 流水线预算 + 12.5% 余量。启动时打印实际数值。
+- **参数自动适配**：`--chunk-size` / `--batch-size` 会按预算推导出的上限收敛——预算越大、单块越大（更少 IPC）；`--workers` 会收敛到 **CPU 核数**（SM3 是 CPU 密集型，进程多于核数只增开销）。被调整时打印 `[INFO] 根据缓存预算与 CPU 调整参数: ...`。
 - 该预算是**缓存预算，不是进程 RSS 上限**：Python 运行时、compaction 临时分配与操作系统页缓存均不计入其中。
+- 想预留更多内存给其他进程时，用 `--mem-budget` 把预算压低即可。
 
 ## 环境要求
 
@@ -66,10 +68,11 @@ python generate.py \
 | --- | --- | --- |
 | `--prefix-file` | 号段前缀文件（生成模式必填） | — |
 | `--db-root` | RocksDB 输出目录 | `/data/rocksdb/phone_sm3` |
-| `--workers` | SM3 计算进程数（受缓存预算上限约束，可能被自动下调） | 30 |
+| `--mem-budget` | 共享缓存预算（MiB）；`0` 表示按可用内存自动确定 | `0`（自动） |
+| `--workers` | SM3 计算进程数（收敛到 CPU 核数） | 30 |
 | `--shards` | 分片数（**必须是 1~256 范围内的 2 的幂**） | 32 |
-| `--chunk-size` | 每个计算任务的手机号数量（受缓存预算上限约束） | 500000 |
-| `--batch-size` | RocksDB WriteBatch 大小（受缓存预算上限约束） | 200000 |
+| `--chunk-size` | 每个计算任务的手机号数量（受预算推导上限约束） | 500000 |
+| `--batch-size` | RocksDB WriteBatch 大小（受预算推导上限约束） | 200000 |
 | `--tmp-root` | 临时目录，**仅 `--phase2-only` 使用** | `/data/rocksdb_build_tmp` |
 | `--builder-workers` | **已弃用**：所有 shard 现由同一进程写入以共享缓存（传入仅打印提示） | — |
 | `--keep-temp` | **兼容保留**：流式生成不再创建临时文件，此开关无实际作用 | 关 |
@@ -103,7 +106,8 @@ python append.py \
 | `--prefix-file` | 号段前缀文件（格式同 `prefixes.txt`） | — |
 | `--db-root` | 既有 RocksDB 目录；不存在则新建 | `/data/rocksdb/phone_sm3` |
 | `--shards` | 分片数，**必须与原库相同**（1~256 范围内的 2 的幂） | 32 |
-| `--workers` / `--chunk-size` / `--batch-size` | 同 `generate.py`，受缓存预算上限约束 | 30 / 500000 / 200000 |
+| `--mem-budget` | 共享缓存预算（MiB）；`0` 表示按可用内存自动确定 | `0`（自动） |
+| `--workers` / `--chunk-size` / `--batch-size` | 同 `generate.py`，受内存自适应预算与 CPU 约束 | 30 / 500000 / 200000 |
 
 > `--shards` 必须与生成原库时一致，否则分片定位错乱会导致查询查不到。`--prefix` 与 `--prefix-file` 可同时使用，至少需指定其一。
 
