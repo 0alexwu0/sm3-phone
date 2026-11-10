@@ -150,26 +150,93 @@ curl "http://localhost:8080/query/$SM3"
 
 ## Docker
 
-镜像内包含 `generate.py`、`append.py`、`server.py` 与 `prefixes.txt`，默认启动查询服务。`/data/rocksdb` 声明为数据卷，**生成、追加与查询都必须挂载同一个宿主机目录**，否则数据只写在容器内，容器删除后即丢失。
+镜像内包含 `generate.py`、`append.py`、`server.py` 与 `prefixes.txt`，默认启动查询服务。
+
+### 获取镜像
+
+任选一种方式，得到的都是同一个镜像：
 
 ```bash
-docker build -t sm3-phone .
+# 方式一：从 GHCR 拉取（推荐）
+docker pull ghcr.io/0alexwu0/sm3-phone:v1.0.1     # 或 :latest
 
-# 1. 生成（数据写入宿主机 /path/to/rocksdb/phone_sm3）
-docker run --rm -v /path/to/rocksdb:/data/rocksdb sm3-phone \
-  python generate.py --prefix-file prefixes.txt --shards 32
+# 方式二：离线环境，从 GitHub Release 下载镜像包后导入
+#   https://github.com/0alexwu0/sm3-phone/releases 下载 sm3-phone-v1.0.1-docker.tar.gz
+docker load < sm3-phone-v1.0.1-docker.tar.gz
 
-# 2. 追加号段（先停止查询服务；挂载同一目录）
-docker run --rm -v /path/to/rocksdb:/data/rocksdb sm3-phone \
-  python append.py --prefix 166 --prefix 199
-
-# 3. 启动 / 重启查询服务
-docker run -d --name sm3-phone -p 8080:8080 \
-  -v /path/to/rocksdb:/data/rocksdb \
-  -e SHARDS=32 sm3-phone
+# 方式三：从源码自行构建
+docker build -t ghcr.io/0alexwu0/sm3-phone:v1.0.1 .
 ```
 
-环境变量 `DB_ROOT`（默认 `/data/rocksdb/phone_sm3`）与 `SHARDS`（默认 `32`）供查询服务使用；镜像内置基于 `/health` 的健康检查。
+下文以 `IMAGE=ghcr.io/0alexwu0/sm3-phone:v1.0.1` 为例。
+
+### 数据目录
+
+`/data/rocksdb` 是镜像声明的数据卷，库默认位于其中的 `phone_sm3/`。**生成、追加与查询必须挂载同一个宿主机目录**，否则数据只写在容器内，容器删除后即丢失：
+
+```bash
+mkdir -p /path/to/rocksdb        # 宿主机数据目录，库会落在 /path/to/rocksdb/phone_sm3
+```
+
+### 1. 生成数据库
+
+```bash
+docker run --rm -v /path/to/rocksdb:/data/rocksdb $IMAGE \
+  python generate.py --prefix-file prefixes.txt --shards 32
+```
+
+使用自定义号段文件时，把文件挂进容器：
+
+```bash
+docker run --rm -v /path/to/rocksdb:/data/rocksdb \
+  -v $PWD/my_prefixes.txt:/app/my_prefixes.txt:ro $IMAGE \
+  python generate.py --prefix-file my_prefixes.txt --shards 32
+```
+
+### 2. 启动查询服务
+
+```bash
+docker run -d --name sm3-phone --restart unless-stopped \
+  -p 8080:8080 -v /path/to/rocksdb:/data/rocksdb \
+  -e SHARDS=32 $IMAGE
+
+docker ps                      # STATUS 中显示 (healthy) 即就绪
+curl http://localhost:8080/health
+```
+
+| 环境变量 | 说明 | 默认 |
+| --- | --- | --- |
+| `DB_ROOT` | 容器内库目录 | `/data/rocksdb/phone_sm3` |
+| `SHARDS` | 分片数，必须与生成时一致 | `32` |
+
+镜像内置基于 `/health` 的健康检查。
+
+### 3. 追加号段
+
+查询服务只能看到启动时的数据，所以追加时先停服务，追加完成后再启动：
+
+```bash
+docker stop sm3-phone
+
+docker run --rm -v /path/to/rocksdb:/data/rocksdb $IMAGE \
+  python append.py --prefix 166 --prefix 199
+
+docker start sm3-phone
+```
+
+`append.py` 会自动识别既有库的分片数；如果挂载的目录里找不到既有库，会直接报错，不会静默新建空库。
+
+### 升级镜像
+
+数据在宿主机目录中，与镜像版本无关，替换容器即可：
+
+```bash
+docker pull ghcr.io/0alexwu0/sm3-phone:latest
+docker rm -f sm3-phone
+docker run -d --name sm3-phone --restart unless-stopped \
+  -p 8080:8080 -v /path/to/rocksdb:/data/rocksdb \
+  -e SHARDS=32 ghcr.io/0alexwu0/sm3-phone:latest
+```
 
 ## 许可证
 
