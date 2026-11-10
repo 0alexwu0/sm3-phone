@@ -1,0 +1,14 @@
+.git
+.github
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+data/
+rocksdb/
+rocksdb_build_tmp/
+phone_sm3/
+shard_*/
+*.bin
+*.sst
+*.log

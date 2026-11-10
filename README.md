@@ -106,13 +106,19 @@ python append.py \
 | --- | --- | --- |
 | `--prefix` | 要追加的号段前缀，可重复指定；与 `--prefix-file` 合并去重 | — |
 | `--prefix-file` | 号段前缀文件（格式同 `prefixes.txt`） | — |
-| `--db-root` | 既有 RocksDB 目录；不存在则新建 | `/data/rocksdb/phone_sm3` |
-| `--shards` | 分片数，**必须与原库相同**（1~256 范围内的 2 的幂） | 32 |
+| `--db-root` | 既有 RocksDB 目录；**默认必须已存在** | `/data/rocksdb/phone_sm3` |
+| `--allow-create` | 允许在库不存在时新建（默认拒绝） | 关 |
+| `--shards` | 分片数；默认自动识别既有库，显式指定时必须与原库相同 | 自动识别（新建时 32） |
 | `--mem-budget` | 共享缓存预算（MiB）；`0` 表示按可用内存自动确定 | `0`（自动） |
 | `--builder-workers` | 并行写入进程数（同 `generate.py`） | 1 |
 | `--workers` / `--chunk-size` / `--batch-size` | 同 `generate.py`，受内存自适应预算与 CPU 约束 | 30 / 500000 / 200000 |
 
-> `--shards` 必须与生成原库时一致，否则分片定位错乱会导致查询查不到。`--prefix` 与 `--prefix-file` 可同时使用，至少需指定其一。
+> 为防止原有数据"丢失"，`append.py` 会：
+> - 在 `--db-root` 下找不到既有 `shard_XX` 时**直接报错**，而不是静默新建一个只含新号段的库（常见于路径写错或 Docker 未挂载数据卷）；确需新建请加 `--allow-create`；
+> - 自动识别既有库的分片数，`--shards` 与之不一致时拒绝执行（分片数不同会让原有数据按新分片规则查不到）；
+> - 追加前从每个 shard 抽样既有记录，追加后重新打开逐条校验，并打印前后记录数估计值。
+>
+> 查询服务以只读方式打开库，只能看到启动时的数据：**追加完成后需重启查询服务**，新号段才可查。`--prefix` 与 `--prefix-file` 可同时使用，至少需指定其一。
 
 ## 启动查询服务
 
@@ -144,14 +150,26 @@ curl "http://localhost:8080/query/$SM3"
 
 ## Docker
 
+镜像内包含 `generate.py`、`append.py`、`server.py` 与 `prefixes.txt`，默认启动查询服务。`/data/rocksdb` 声明为数据卷，**生成、追加与查询都必须挂载同一个宿主机目录**，否则数据只写在容器内，容器删除后即丢失。
+
 ```bash
 docker build -t sm3-phone .
-docker run --rm -p 8080:8080 \
-  -v /path/to/rocksdb/phone_sm3:/data/rocksdb/phone_sm3 \
-  sm3-phone
+
+# 1. 生成（数据写入宿主机 /path/to/rocksdb/phone_sm3）
+docker run --rm -v /path/to/rocksdb:/data/rocksdb sm3-phone \
+  python generate.py --prefix-file prefixes.txt --shards 32
+
+# 2. 追加号段（先停止查询服务；挂载同一目录）
+docker run --rm -v /path/to/rocksdb:/data/rocksdb sm3-phone \
+  python append.py --prefix 166 --prefix 199
+
+# 3. 启动 / 重启查询服务
+docker run -d --name sm3-phone -p 8080:8080 \
+  -v /path/to/rocksdb:/data/rocksdb \
+  -e SHARDS=32 sm3-phone
 ```
 
-镜像内已包含 `generate.py` 与 `server.py`；默认启动查询服务，数据库需通过 volume 挂载（或先在容器内生成）。
+环境变量 `DB_ROOT`（默认 `/data/rocksdb/phone_sm3`）与 `SHARDS`（默认 `32`）供查询服务使用；镜像内置基于 `/health` 的健康检查。
 
 ## 许可证
 
